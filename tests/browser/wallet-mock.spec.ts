@@ -27,9 +27,10 @@ test.describe("wallet-gated money paths", () => {
       page.getByRole("button", { name: /create & fund/i }),
     ).toHaveCount(0);
 
-    // The connect control is the only way forward.
+    // The connect control is the only way forward. Scoped to the page body:
+    // the header's own connect button is also labelled "Connect wallet".
     await expect(
-      page.getByRole("button", { name: /connect wallet/i }),
+      page.getByRole("main").getByRole("button", { name: /connect wallet/i }),
     ).toBeVisible();
     expect(errors).toEqual([]);
   });
@@ -50,7 +51,10 @@ test.describe("wallet-gated money paths", () => {
     trackPageErrors(page, errors);
 
     await page.goto("/en/explorer", { waitUntil: "domcontentloaded" });
-    await page.getByRole("button", { name: "Connect", exact: true }).click();
+    await page
+      .getByRole("banner")
+      .getByRole("button", { name: "Connect", exact: true })
+      .click();
 
     const dialog = page.getByRole("dialog", { name: "Connect wallet" });
     await expect(dialog).toBeVisible();
@@ -62,6 +66,24 @@ test.describe("wallet-gated money paths", () => {
     // Dismissing must leave the page intact.
     await dialog.getByRole("button", { name: "Close" }).click();
     await expect(dialog).toBeHidden();
+    expect(errors).toEqual([]);
+  });
+
+  test("a payout card never offers a parked withdraw on an unconfigured chain", async ({
+    page,
+  }) => {
+    const errors: string[] = [];
+    trackPageErrors(page, errors);
+
+    // The smoke build has no market contract and no connected wallet, so there
+    // is no signer to read a parked balance for. The card must fail closed: the
+    // parked-payout withdraw surface stays hidden rather than offering a money
+    // action it cannot back.
+    await page.goto("/en/vs/1", { waitUntil: "domcontentloaded" });
+    await expectMainLandmark(page);
+    await expect(
+      page.getByTestId("parked-payout-card"),
+    ).toHaveCount(0);
     expect(errors).toEqual([]);
   });
 });

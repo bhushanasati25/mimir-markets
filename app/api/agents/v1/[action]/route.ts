@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { withRequestId } from "@/lib/api/errors";
 import { verifyAgentSignature } from "@/lib/agents/signature";
 import { isStellarAccount } from "@/lib/stellar-message";
-import { getUserVSDirect } from "@/lib/contract";
+import { getUserVKDFrom } from "@/lib/contract";
 import {
   NETWORK_PASSPHRASE,
   STELLAR_NETWORK,
@@ -42,27 +43,22 @@ import { validateAgentApiRequest, schemaVersionHeaders } from "@/lib/api/schema"
 import { gateOrPause, pausedCapabilityError, getCapabilityPauseDetail } from "@/lib/server/pause-registry";
 import { apiError } from "@/lib/api/errors";
 import { tracedRoute } from "@/lib/ops/trace-http";
+import { fetchResearch, BudgetExhaustedError } from "@/lib/research/gateway";
 
 export const dynamic = "force-dynamic";
 
 /**
  * Wallet identities an agent record can carry.
  *
- * Stellar only now: `G…` for an account, `C…` for a contract account. The `0x…`
- * arm existed because the worker agents under `agents/**` still signed with EVM
- * keys during the migration; they hold Stellar keypairs as of this phase, so
- * accepting an EVM address here would only let a caller register an identity that
- * can never sign, stake, or be paid.
+ * Stellar only now: `G` for an account, `C` for a contract account. The `0x` arm existed because the worker agents under `agents/**` still signed with EVM keys during the migration; they hold Stellar keypairs as of this phase, so accepting an EVM address here would only let a caller register an identity that can never sign, stake, or be paid.
  *
- * Nothing below normalises case. A strkey is case-SENSITIVE base32 — lowercasing
- * one produces a string `isStellarAccount` rejects outright — so trimming is the
- * only safe normalisation, and every comparison is exact.
+ * Nothing below normalises case. A strkey is case-SENSITIVE Base32 — lowercasing one produces a string `isStellarAccount` rejects outright — so trimming is the only safe normalisation, and every comparison is exact.
  */
 function isWalletAddress(value: string): boolean {
   return isStellarAccount(value) || isContractAddress(value.trim());
 }
 
-/** Trim only: a Stellar strkey has no case-normalised form. */
+/* Trim only: a Stellar strkey has no case-normalised form. */
 function normalizeWallet(value: string): string {
   return value.trim();
 }
@@ -70,8 +66,6 @@ function normalizeWallet(value: string): string {
 function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { "cache-control": "no-store", ...schemaVersionHeaders() } });
 }
-
-import { withRequestId } from "@/lib/api/errors";
 
 /** Convert a structured ApiErrorResult from lib/api/errors into a Response. */
 /** Map an authorizeAction() rejection to the typed agent API error envelope. */
@@ -194,24 +188,19 @@ async function register(request: SignedAgentRequest<Record<string, any>>): Promi
   const requestedCapabilities = Array.isArray(body.capabilities) ? body.capabilities : [];
   const capabilities = requestedCapabilities.filter((c: unknown): c is AgentCapability =>
     typeof c === "string" && ["market_creator", "council_juror", "researcher", "copy_source", "x402_seller"].includes(c));
-  const agent: AgentRecord = {
-    schemaVersion: REGISTRY_SCHEMA_VERSION, agentId: request.agentId, ownerWallet: owner,
+  const record: AgentRecord = {
+    agentId: request.agentId,
+    ownerWallet: owner,
     operatorWallet: operator,
     payoutWallet,
-    displayName: String(body.displayName ?? request.agentId).slice(0, 80),
-    description: String(body.description ?? "").slice(0, 500),
-    metadataUri: body.metadataUri ? String(body.metadataUri) : undefined,
-    metadataHash: body.metadataHash ? String(body.metadataHash) : undefined,
-    capabilities, authorityLevel: authority,
-    limits: { ...defaultLimits(), ...(body.limits ?? {}) }, status: "active",
-    reputationBps: 0, createdAt: now, updatedAt: now,
+    authorityLevel: authority,
+    capabilities,
+    status: "active",
+    createdAt: now,
+    updatedAt: now,
   };
-  // Capabilities above the owner-granted level are dropped, never silently usable.
-  agent.capabilities = agent.capabilities.filter((capability) =>
-    authorizeAction(agent, { capability, positionUsdc: 0 }).allowed ||
-    (capability === "market_creator" && authority >= AUTHORITY_LEVELS.PROPOSE));
-  await saveAgent(agent);
-  const payload = { agent };
+  await saveAgent(record);
+  const payload = { agent: record };
   if (request.idempotencyKey) {
     await saveIdempotentResponse(request.agentId, "register", request.idempotencyKey, payload, 200);
   }
@@ -229,7 +218,11 @@ async function handleAgentApiPost(
   context: { params: Promise<{ action: string }> },
 ): Promise<Response> {
   const { action: rawAction } = await context.params;
-  if (!(AGENT_API_ACTIONS as readonly string[]).includes(rawAction)) return json({ error: { message: "unknown action", requestId } }, 404);
+  // Correlates the early rejections below, which happen before an agent is known.
+  const requestId = randomUUID();
+  if (!(AGENT_API_ACTIONS as readonly string[]).includes(rawAction)) {
+    return errorResponse(withRequestId(apiError("not_found", "unknown action"), requestId));
+  }
   const action = rawAction as AgentApiAction;
   // Cap before parse: Content-Length is a cheap fail-closed gate; the body byte
   // check below still applies when the header is absent or wrong.
@@ -284,7 +277,7 @@ async function handleAgentApiPost(
   if (request.action !== action) return json({ error: { message: "action/path mismatch" } }, 400);
   const envelopeErrors = validateAgentRequestEnvelope(request, Date.now(), { requireSignature: !viaApiKey });
   if (envelopeErrors.length) return json({ error: { message: envelopeErrors.join("; ") } }, 400);
-  
+
   // Drift check: validate the request body shape against the schema spec.
   const shapeResult = validateAgentApiRequest(request);
   if (!shapeResult.ok) {
@@ -305,7 +298,7 @@ async function handleAgentApiPost(
       return json({ error: { message: "signature rejected" } }, 401);
     }
     const { authorizeRequest } = await import("@/lib/api/policy");
-    const gate = authorizeRequest("registered_agent", {
+    const gate = await authorizeRequest("registered_agent", {
       route: `/api/agents/v1/${action}`,
       wallet: signer,
       agentId: agent.agentId,
@@ -397,17 +390,6 @@ async function handleAgentApiPost(
     const keyId = String(body.keyId ?? "");
     if (!keyId) return json({ error: { message: "keyId is required" } }, 400);
     const revoked = await revokeAgentApiKey(agent.agentId, keyId, Date.now(), String(body.reason ?? "owner revoked"));
-    if (!revoked) return json({ error: { message: "key not found" } }, 404);
-    result = { revoked: true };
-  } else if (action === "heartbeat") {
-    await saveAgent({ ...agent, updatedAt: Date.now() });
-    result = { ok: true };
-  } else if (action === "listPositions") {
-    // Placeholder for position listing logic
-    result = { positions: [] };
-  } else if (action === "listEarnings") {
-    const summary = await getAgentEarningsSummary(agent.agentId);
-    result = { earnings: summary };
     if (!revoked) return json({ error: { message: "key not found or already revoked" } }, 404);
     result = { keyId, revoked: true };
   } else if (action === "rotateKey") {
@@ -529,76 +511,92 @@ async function handleAgentApiPost(
     const revoked = revokeAgent(agent, { requestedBy: agent.ownerWallet, reason: String(body.reason ?? "owner revoked") });
     if (!revoked.ok) return json({ error: { message: revoked.reason } }, 403);
     await saveAgent(revoked.agent); result = { agent: revoked.agent };
+  } else if (action === "publishReasoning") {
+    const gate = authorizeAction(agent, { capability: "researcher", requestsThisHour: Number(body.requestsThisHour ?? 0) });
+    if (!gate.allowed) {
+      await audit(request, "rejected", gate.reason);
+      return errorResponse(actionVerdictToError(gate, "researcher"));
+    }
+    result = await publishReasoning({ ...(body as any), agentId: agent.agentId });
   } else if (action === "fetchResearch") {
     const gate = authorizeAction(agent, { capability: "researcher", requestsThisHour: Number(body.requestsThisHour ?? 0) });
     if (!gate.allowed) {
       await audit(request, "rejected", gate.reason);
-      return json({ error: { message: gate.reason, detail: gate.detail } }, 403);
+      return errorResponse(actionVerdictToError(gate, "researcher"));
     }
-    const adapterId = typeof body.adapterId === "string" ? body.adapterId : "";
-    const url = typeof body.url === "string" ? body.url : "";
-    if (!url || !adapterId) {
-      return errorResponse(apiError("invalid_request", "url and adapterId are required"));
-    }
-    const fetchRes = await fetchWithAdapter(adapterId, { url, agentId: agent.agentId });
-    if (!fetchRes.ok) {
-      if (fetchRes.kind === "adapter") return errorResponse(apiError("invalid_request", fetchRes.detail));
-      let code: ApiErrorCode;
-      switch (fetchRes.kind) {
-        case "paused": code = "agent_paused"; break;
-        case "blocked": code = "forbidden"; break;
-        case "budget": code = "budget_exhausted"; break;
-        case "too_many_redirects":
-        case "redirect_loop":
-        case "invalid_redirect":
-        case "protocol_downgrade":
-        case "content_type":
-        case "too_large":
-        case "http_error":
-          code = "invalid_request"; break;
-        case "cancelled":
-        case "dependency_failure":
-        case "transport":
-          code = "upstream_unavailable"; break;
+    try {
+      result = await fetchResearch({ ...(body as any), agentId: agent.agentId });
+    } catch (err) {
+      if (err instanceof BudgetExhaustedError) {
+        await audit(request, "rejected", "budget_exhausted");
+        return errorResponse(apiError("budget_exhausted", err.message));
       }
-      return errorResponse(apiError(code, fetchRes.detail));
+      throw err;
     }
-    result = {
-      ok: true,
-      url: fetchRes.url,
-      finalUrl: fetchRes.finalUrl,
-      status: fetchRes.status,
-      contentType: fetchRes.contentType,
-      body: fetchRes.body,
-      contentHash: fetchRes.contentHash,
-      capturedAt: fetchRes.capturedAt,
-      bytes: fetchRes.bytes,
-      fromCache: fetchRes.fromCache,
-      redirects: fetchRes.redirects,
-      redirectChain: fetchRes.redirectChain,
-      budget: budgetRemaining(agent.agentId),
-    };
-  } else if (action === "publishReasoning") {
-    await publishReasoning(agent.agentId, body.reasoning);
-    result = { published: true };
-  } else if (action === "revoke") {
-    await revokeAgent(agent.agentId, Date.now(), String(body.reason ?? "owner revoked"));
-    result = { revoked: true };
-    const gate = authorizeAction(agent, { capability: "researcher", requestsThisHour: Number(body.requestsThisHour ?? 0) });
-    if (!gate.allowed) {
-      await audit(request, "rejected", gate.reason);
-      return json({ error: { message: gate.reason, detail: gate.detail } }, 403);
-    }
-    result = await publishReasoning({ ...(body as any), agentId: agent.agentId });
   } else {
-    return json({ error: { message: "unknown action" } }, 404);
+    const capability: AgentCapability = action === "proposeMarket" || action === "createMarket" || action === "dryRun"
+      ? "market_creator" : "council_juror";
+    const proposalOnly = action === "proposeMarket";
+    const gate = authorizeAction(agent, {
+      capability, category: body.category, settlementMode: body.settlementMode,
+      positionAtomic: parseUsdcAtomic(String(body.positionUsdc ?? body.stakeUsdc ?? 0)).toString(),
+      exposureTodayAtomic: parseUsdcAtomic(String(body.exposureTodayUsdc ?? 0)).toString(),
+      activeMarkets: Number(body.activeMarkets ?? 0), requestsThisHour: Number(body.requestsThisHour ?? 0),
+      proposalOnly,
+    } as any);
+    if (!gate.allowed) return json({ error: { message: gate.reason, detail: gate.detail } }, 403);
+    if (action === "dryRun") {
+      // ── What "allowance" means now ──────────────────────────────────────────
+      // The EVM version read the ERC-20 allowance the agent had granted the
+      // market contract, because a stake could not land without one. Soroban has
+      // no standing allowance on this path: `challenge_claim` carries auth for
+      // exactly the staked amount, so there is nothing to pre-approve and an
+      // allowance read would always be zero and always look like a blocker.
+      //
+      // The question the dry run is actually asking — "would this stake go
+      // through?" — is now answered by the agent's own USDC BALANCE, so that is
+      // what is reported. Null (no trustline) is deliberately surfaced as zero:
+      // an account with no trustline genuinely cannot stake.
+      let spendable = 0n;
+      if (isMarketConfigured()) {
+        try {
+          spendable = (await getUsdcBalanceUnits(agent.operatorWallet)) ?? 0n;
+        } catch { /* report zero; dry-run stays safe */ }
+      }
+      result = buildAgentDryRun({
+        principalUsdc: Number(body.principalUsdc ?? body.stakeUsdc ?? 0),
+        grossPayoutUsdc: Number(body.grossPayoutUsdc ?? body.stakeUsdc ?? 0),
+        outcome: body.outcome ?? "creator_wins", allowanceAtomic: spendable,
+        requiredAtomic: usdcToUnits(Number(body.stakeUsdc ?? body.positionUsdc ?? 0)),
+        platformFeeBps: Number(body.platformFeeBps ?? 0),
+        agentOwnerFeeBps: Number(body.agentOwnerFeeBps ?? 0),
+        platformRecipient: String(body.platformRecipient ?? agent.ownerWallet),
+        ownerRecipient: agent.payoutWallet, policy: gate,
+      });
+    } else result = action === "proposeMarket"
+      ? { disposition: "review", proposal: body, moderationRequired: true }
+      : {
+          allowed: true, simulated: false, contract: getMarketContractId(),
+          // Stellar has no numeric chain id. The network passphrase is the
+          // equivalent domain separator — it is what every Stellar signature is
+          // bound to at the protocol level — so it is what a caller needs in order
+          // to build a transaction this deployment will accept. The short name is
+          // sent alongside it because that is the readable half.
+          network: STELLAR_NETWORK,
+          networkPassphrase: NETWORK_PASSPHRASE,
+          requiresExternalWalletSignature: true,
+          contractConfigured: isMarketConfigured(),
+          // The contract freezes the fee recipient onto the claim at creation, so a
+          // market opened without one can never pay this agent's owner — however
+          // the policy changes later. Handed back explicitly so a caller cannot omit
+          // it by accident and silently forfeit its own revenue.
+          agentOwnerRecipient: agent.payoutWallet,
+          feeNote: `Pass agent_owner_recipient=${agent.payoutWallet} in CreateParams to earn the agent-owner fee on this market.`,
+          preview: { positionUsdc: Number(body.positionUsdc ?? body.stakeUsdc ?? 0) },
+        };
   }
-
-  await saveIdempotentResponse(agent.agentId, action, request.idempotencyKey, {
-    status: 200,
-    body: result,
-  });
   await audit(request, "accepted");
+  await saveIdempotentResponse(agent.agentId, action, request.idempotencyKey, result);
   return json(result);
 }
 

@@ -1,12 +1,12 @@
 //! Public contract surface. Bodies live in `pool`; this file is the single
 //! `#[contractimpl]` block plus the read-only views.
 
-use soroban_sdk::{contract, contractimpl, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
 
 use crate::escrow;
 use crate::pool;
 use crate::storage;
-use crate::types::{ClaimResult, Error, Market, PendingOracle};
+use crate::types::{ClaimResult, Error, Market, PendingOracle, MAX_BATCH_SIZE};
 
 #[contract]
 pub struct MimirSquad;
@@ -62,9 +62,9 @@ impl MimirSquad {
         pool::resolve(&env, market_id, result)
     }
 
-    /// Captain-initiated market cancellation. Sets the market as resolved with
-    /// result=RESULT_CANCELLED, allowing all depositors to claim full refunds
-    /// via the claim() function. No fees are charged on cancellation.
+    /// Captain-initiated market cancellation, only before the deadline. Sets the
+    /// market as resolved with result=RESULT_CANCELLED, allowing all depositors
+    /// to claim full refunds via claim(). No fees are charged on cancellation.
     pub fn cancel_market(env: Env, market_id: u64) -> Result<(), Error> {
         pool::cancel_market(&env, market_id)
     }
@@ -96,6 +96,24 @@ impl MimirSquad {
 
     pub fn get_market(env: Env, market_id: u64) -> Result<Market, Error> {
         storage::get_market(&env, market_id)
+    }
+
+    pub fn get_markets_batch(
+        env: Env,
+        ids: Vec<u64>,
+    ) -> Result<Vec<Option<Market>>, Error> {
+        if ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        if !storage::is_initialized(&env) {
+            return Err(Error::NotInitialized);
+        }
+
+        let mut results: Vec<Option<Market>> = Vec::new(&env);
+        for id in ids.iter() {
+            results.push_back(storage::get_market_opt(&env, id));
+        }
+        Ok(results)
     }
 
     pub fn get_deposit(env: Env, market_id: u64, side: u32, who: Address) -> i128 {
@@ -137,12 +155,46 @@ impl MimirSquad {
         storage::oracle(&env)
     }
 
+    /// Queue an oracle rotation; the current oracle must authorize.
+    pub fn queue_oracle(env: Env, new_oracle: Address) -> Result<(), Error> {
+        pool::queue_oracle(&env, new_oracle)
+    }
+
+    /// Drop a queued oracle rotation; the current oracle must authorize.
+    pub fn cancel_oracle(env: Env) -> Result<(), Error> {
+        pool::cancel_oracle(&env)
+    }
+
+    /// Apply a queued oracle rotation once its timelock has elapsed.
+    pub fn execute_oracle(env: Env) -> Result<(), Error> {
+        pool::execute_oracle(&env)
+    }
+
     pub fn get_pending_oracle(env: Env) -> Option<PendingOracle> {
         storage::pending_oracle(&env)
     }
 
+    /// Queue a fee recipient rotation; the current fee recipient must authorize.
+    pub fn queue_fee_recipient(env: Env, new_recipient: Address) -> Result<(), Error> {
+        pool::queue_fee_recipient(&env, new_recipient)
+    }
+
+    /// Drop a queued fee recipient rotation; the current fee recipient must authorize.
+    pub fn cancel_fee_recipient(env: Env) -> Result<(), Error> {
+        pool::cancel_fee_recipient(&env)
+    }
+
+    /// Apply a queued fee recipient rotation once its timelock has elapsed.
+    pub fn execute_fee_recipient(env: Env) -> Result<(), Error> {
+        pool::execute_fee_recipient(&env)
+    }
+
     pub fn get_fee_recipient(env: Env) -> Result<Address, Error> {
         storage::fee_recipient(&env)
+    }
+
+    pub fn get_pending_fee_recipient(env: Env) -> Option<Address> {
+        storage::pending_fee_recipient(&env)
     }
 
     pub fn get_escrow_balance(env: Env) -> Result<i128, Error> {

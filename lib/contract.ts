@@ -39,6 +39,7 @@
 import { Buffer } from "buffer";
 
 import { MimirMarket, MimirSquad } from "@/sdk/contracts";
+import { inviteKeyMatches } from "@/lib/invite-key";
 
 import {
   STELLAR_READ_CONCURRENCY,
@@ -57,7 +58,20 @@ import { MIN_STAKE_USDC, unitsToUsdc, usdcToUnits } from "./usdc";
 import { normalizeCategoryId, ZERO_ADDRESS } from "./constants";
 import { guardChallenge, toCanonicalMode } from "./market-modes";
 import { checkWriteAllowed } from "./ops/flags";
-import { wrapStellarTransactionError } from "./settlement-retry";
+import {
+  contractErrorFromRustError,
+  contractReadErrorFromRustError,
+  contractWriteErrorFromRustError,
+  isContractError,
+  isContractReadError,
+  isContractWriteError,
+  categoryForError,
+  categoryForLabel,
+  CONTRACT_ERROR_LABELS,
+  type ContractError,
+  type ContractReadError,
+  type ContractWriteError,
+} from "./contract-errors";
 import { availableCreatorLiquidityUnits } from "./payout";
 import { decodeHash32Hex } from "./content-hash";
 import { getDemoSecret } from "./demo-signers";
@@ -288,6 +302,16 @@ export interface VSDetailSnapshot {
 /** A wallet argument: a real signer, or a bare address for legacy call sites. */
 export type WalletArg = string | StellarSigner;
 
+/**
+ * Machine-readable contract error surfaced to the app.
+ *
+ * `code` is a compact, stable id (e.g. `claim_not_open`) that survives JSON
+ * round-trips and is what server routes turn into `createApiError(code, msg)`.
+ * `category` is the UI/analytics bucket. `userMessage` is the actionable copy a
+ * person can act on; it is never raw Rust. `retryable` is always false here:
+ * a contract revert means the request was wrong, not that the network hiccuped.
+ */
+
 // ── State / side mappers ──────────────────────────────────────────────────────
 function mapState(state: MimirMarket.ClaimState): ClaimData["state"] {
   switch (state) {
@@ -355,7 +379,7 @@ function unwrap<T>(label: string, result: unknown): T {
         error && typeof error === "object" && "message" in error
           ? String((error as { message: unknown }).message)
           : JSON.stringify(error);
-      throw new Error(`${label}: ${message}`);
+      throw contractErrorFromRustError(error, categoryForLabel(label));
     }
     return rustResult.unwrap();
   }
@@ -1937,12 +1961,40 @@ export async function getClaimSummaries(
   return results.filter(Boolean) as ClaimData[];
 }
 
-/** Returns a single claim, optionally checking invite key. */
+/**
+ * Returns a claim for an invite-key reader.
+ *
+ * A public claim is returned as is. A private claim is returned only when the
+ * supplied key hashes to the `invite_key_hash` stored on chain; any other key,
+ * no key, or a private claim without a stored hash yields `null` (fail closed),
+ * which the route reports as a plain 404.
+ */
 export async function getClaimWithAccess(
   claimId: number,
-  _inviteKey?: string,
+  inviteKey?: string,
+  deps: {
+    readClaim?: (id: number) => Promise<ClaimData | null>;
+    readInviteHash?: (id: number) => Promise<Uint8Array | null>;
+  } = {},
 ): Promise<ClaimData | null> {
-  return readClaimRaw(claimId);
+  const claim = await (deps.readClaim ?? readClaimRaw)(claimId);
+  if (!claim) return null;
+  if (!claim.is_private) return claim;
+  if (!inviteKey) return null;
+  const expected = await (deps.readInviteHash ?? readInviteKeyHash)(claimId);
+  return inviteKeyMatches(inviteKey, expected) ? claim : null;
+}
+
+/** The claim's on-chain `invite_key_hash`, or null when unset or unreadable. */
+async function readInviteKeyHash(claimId: number): Promise<Uint8Array | null> {
+  try {
+    const tx = await marketReader().get_claim_market_config({ claim_id: BigInt(claimId) });
+    const config = unwrapOrNull<MimirMarket.MarketConfig>(tx.result);
+    const hash = config?.invite_key_hash;
+    return hash ? new Uint8Array(hash) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Returns open/active public claims as ClaimData. */

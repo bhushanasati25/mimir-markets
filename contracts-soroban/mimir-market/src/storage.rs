@@ -5,7 +5,15 @@
 
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
-use crate::types::{Challenger, Claim, Error, FeePolicy, PendingFeePolicy, RematchStatus};
+use crate::types::{
+    Challenger, ChallengerPage, Claim, Error, FeePolicy, PendingFeePolicy, PendingOracle,
+    RematchStatus, Verdict,
+};
+
+/// Maximum number of addresses accepted by [`get_withdrawable_batch`].
+///
+/// Keeps the ledger-entry footprint of a single read bounded.
+pub const MAX_BATCH_SIZE: u32 = 50;
 
 #[contracttype]
 #[derive(Clone)]
@@ -25,6 +33,10 @@ pub enum DataKey {
     FeesClaimed,
     Claim(u64),
     Challengers(u64),
+    /// Versioned verdict written at resolution. Absent on claims resolved
+    /// before verdicts were versioned; readers fall back to `Claim.winner_side`
+    /// for those.
+    Verdict(u64),
     /// Pull-payment fallback for failed payout pushes.
     Withdrawable(Address),
     /// Accrued, unclaimed fees. Always pulled, never pushed.
@@ -220,9 +232,65 @@ pub fn challengers(env: &Env, id: u64) -> Vec<Challenger> {
     }
 }
 
+/// Return a page of the challenger roster starting at `offset`, up to `limit`
+/// entries. `limit = 0` is treated as "return all remaining entries from
+/// `offset`". Callers should use a non-zero limit in production to bound
+/// ledger-entry footprint.
+///
+/// Never panics: if `offset` is beyond the end of the roster the returned
+/// `items` slice is empty and `total` carries the actual roster length.
+pub fn challengers_page(env: &Env, id: u64, offset: u32, limit: u32) -> ChallengerPage {
+    let list = challengers(env, id);
+    let total = list.len();
+    let start = offset.min(total);
+    let remaining = total - start;
+    let take = if limit == 0 {
+        remaining
+    } else {
+        limit.min(remaining)
+    };
+
+    let mut items = Vec::new(env);
+    for i in start..start + take {
+        items.push_back(list.get(i).unwrap());
+    }
+
+    ChallengerPage {
+        items,
+        offset: start,
+        total,
+    }
+}
+
 pub fn set_challengers(env: &Env, id: u64, list: &Vec<Challenger>) {
     let key = DataKey::Challengers(id);
     env.storage().persistent().set(&key, list);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+}
+
+// ── Versioned verdicts ───────────────────────────────────────────────────────
+
+/// The versioned verdict stored for a resolved claim, if one was written.
+///
+/// `None` is the pre-versioning case: the claim was resolved by a contract
+/// build that stored only `Claim.winner_side`. Callers must fall back to that
+/// field rather than treating the claim as unresolved.
+pub fn verdict(env: &Env, id: u64) -> Option<Verdict> {
+    let key = DataKey::Verdict(id);
+    let stored: Option<Verdict> = env.storage().persistent().get(&key);
+    if stored.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+    }
+    stored
+}
+
+pub fn set_verdict(env: &Env, id: u64, verdict: &Verdict) {
+    let key = DataKey::Verdict(id);
+    env.storage().persistent().set(&key, verdict);
     env.storage()
         .persistent()
         .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
@@ -257,6 +325,28 @@ pub fn add_withdrawable(env: &Env, who: &Address, delta: i128) {
 
 pub fn clear_withdrawable(env: &Env, who: &Address) {
     set_address_i128(env, DataKey::Withdrawable(who.clone()), 0);
+}
+
+/// Batched read of withdrawable balances keyed by an address list.
+///
+/// Returns one entry per input address, in the same order as `addrs`.
+/// Addresses with no parked balance (or never seen) return `0`.
+///
+/// Rejects inputs longer than [`MAX_BATCH_SIZE`] with [`Error::BatchTooLarge`]
+/// *before* touching storage, so an over-sized call costs no ledger reads.
+///
+/// Sits next to `get_claims_batch` as the operator-facing batch primitive for
+/// finding parked payouts without replaying `WithdrawalPending` events.
+pub fn get_withdrawable_batch(env: &Env, addrs: Vec<Address>) -> Result<Vec<i128>, Error> {
+    if addrs.len() > MAX_BATCH_SIZE {
+        return Err(Error::BatchTooLarge);
+    }
+
+    let mut out = Vec::new(env);
+    for who in addrs.iter() {
+        out.push_back(withdrawable(env, &who));
+    }
+    Ok(out)
 }
 
 pub fn accrued_fees(env: &Env, who: &Address) -> i128 {

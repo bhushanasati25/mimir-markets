@@ -18,23 +18,29 @@ interface Particle {
 
 export default function Confetti({ active }: { active: boolean }) {
   const [particles, setParticles] = useState<Particle[]>([]);
+  // Wait for the client preference before creating animated particles.
+  const [reducedMotion, setReducedMotion] = useState<boolean | null>(null);
 
   useEffect(() => {
-    if (!active) {
-      setParticles([]);
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      setReducedMotion(false);
       return;
     }
 
-    const mediaQuery =
-      typeof window !== "undefined"
-        ? window.matchMedia("(prefers-reduced-motion: reduce)")
-        : null;
+    const mediaQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => setReducedMotion(mediaQuery.matches);
 
-    if (mediaQuery?.matches) {
+    update();
+    mediaQuery.addEventListener("change", update);
+
+    return () => mediaQuery.removeEventListener("change", update);
+  }, []);
+
+  useEffect(() => {
+    if (!active || reducedMotion !== false) {
       setParticles([]);
       return;
     }
-
     setParticles(
       Array.from({ length: PARTICLE_COUNT }, (_, i) => ({
         id: i,
@@ -47,24 +53,9 @@ export default function Confetti({ active }: { active: boolean }) {
         delay: Math.random() * 0.5,
       }))
     );
+  }, [active, reducedMotion]);
 
-    const handleChange = (e: MediaQueryListEvent) => {
-      if (e.matches) {
-        setParticles([]);
-      }
-    };
-
-    mediaQuery?.addEventListener?.("change", handleChange);
-    return () => {
-      mediaQuery?.removeEventListener?.("change", handleChange);
-    };
-  }, [active]);
-
-  const prefersReducedMotion =
-    typeof window !== "undefined" &&
-    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-
-  if (!active || prefersReducedMotion || particles.length === 0) return null;
+  if (!active || reducedMotion !== false || particles.length === 0) return null;
 
   return (
     <div
